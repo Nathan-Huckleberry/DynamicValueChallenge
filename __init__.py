@@ -1,238 +1,136 @@
-from __future__ import division # Use floating point for math calculations
-from CTFd.plugins.challenges import BaseChallenge, CHALLENGE_CLASSES
+from CTFd.plugins.challenges import BaseChallenge, CTFdStandardChallenge, CHALLENGE_CLASSES
 from CTFd.plugins import register_plugin_assets_directory
-from CTFd.plugins.keys import get_key_class
-from CTFd.models import db, Solves, WrongKeys, Keys, Challenges, Files, Tags, Teams, Hints
+from CTFd.models import (
+    ChallengeFiles,
+    Challenges,
+    Fails,
+    Flags,
+    Hints,
+    Solves,
+    Tags,
+    db,
+)
 from CTFd import utils
-import math
+from CTFd.plugins.migrations import upgrade
+from CTFd.utils.modes import get_model
+import math, os, urllib, requests
+from flask import request, redirect
+from CTFd.utils.decorators import admins_only
 
+CLIENT_ID = os.environ.get("CLIENT_ID")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
+REDIRECT_URI = os.environ.get("REDIRECT_URI")
+STREAMLABS_API_BASE = 'https://www.streamlabs.com/api/v1.0'
+ACCESS_TOKEN=None
+REFRESH_TOKEN=None
 
-class DynamicValueChallenge(BaseChallenge):
-    id = "dynamic"  # Unique identifier used to register challenges
-    name = "dynamic"  # Name of a challenge type
-    templates = {  # Handlebars templates used for each aspect of challenge editing & viewing
-        'create': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-create.njk',
-        'update': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-update.njk',
-        'modal': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-modal.njk',
+class CTFdStreamChallenge(CTFdStandardChallenge):
+    id = "stream"  # Unique identifier used to register challenges
+    name = "stream"  # Name of a challenge type
+    templates = {  # Templates used for each aspect of challenge editing & viewing
+        "create": "/plugins/StreamLabsCTFdChallenge/assets/create.html",
+        "update": "/plugins/challenges/assets/update.html",
+        "view": "/plugins/challenges/assets/view.html",
     }
-    scripts = {  # Scripts that are loaded when a template is loaded
-        'create': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-create.js',
-        'update': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-update.js',
-        'modal': '/plugins/DynamicValueChallenge/assets/dynamic-challenge-modal.js',
-    }
 
-    @staticmethod
-    def create(request):
-        """
-        This method is used to process the challenge creation request.
+    def refresh_token():
+        global ACCESS_TOKEN
+        global REFRESH_TOKEN
+        r = requests.post(STREAMLABS_API_BASE+"/token", data = {
+            'grant_type': 'refresh_token',
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'redirect_uri': REDIRECT_URI,
+            'refresh_token': REFRESH_TOKEN})
+        ACCESS_TOKEN=r.json()['access_token']
+        REFRESH_TOKEN=r.json()['refresh_token']
+        print(r.text)
 
-        :param request:
-        :return:
-        """
-        files = request.files.getlist('files[]')
 
-        # Create challenge
-        chal = DynamicChallenge(
-            name=request.form['name'],
-            description=request.form['description'],
-            value=request.form['value'],
-            category=request.form['category'],
-            type=request.form['chaltype'],
-            minimum=request.form['minimum'],
-            decay=request.form['decay']
+    def send_first_blood(challenge, user):
+        CTFdStreamChallenge.refresh_token()
+        r = requests.post(STREAMLABS_API_BASE+"/alerts", data = {
+            'access_token': ACCESS_TOKEN,
+            'type': 'donation',
+            'message': '{} got first blood on {}!'.format(user.name, challenge.name),
+            'image_href': 'https://i.ibb.co/9n10Bp7/blood.gif'
+        })
+        print(r.text)
+
+    def send_first_three(challenge, user):
+        CTFdStreamChallenge.refresh_token()
+        r = requests.post(STREAMLABS_API_BASE+"/alerts", data = {
+            'access_token': ACCESS_TOKEN,
+            'type': 'donation',
+            'message': '{} got first three on {}!'.format(user.name, challenge.name),
+            'image_href': 'https://i.ibb.co/rsPqS9D/flag2.gif'
+        })
+        print(r.text)
+
+    @classmethod
+    def callback(cls, challenge, user):
+        Model = get_model()
+
+        solve_count = (
+            Solves.query.join(Model, Solves.account_id == Model.id)
+            .filter(
+                Solves.challenge_id == challenge.id,
+                Model.hidden == False,
+                Model.banned == False,
+            )
+            .count()
         )
 
-        if 'hidden' in request.form:
-            chal.hidden = True
-        else:
-            chal.hidden = False
-
-        max_attempts = request.form.get('max_attempts')
-        if max_attempts and max_attempts.isdigit():
-            chal.max_attempts = int(max_attempts)
-
-        db.session.add(chal)
         db.session.commit()
 
-        flag = Keys(chal.id, request.form['key'], request.form['key_type[0]'])
-        if request.form.get('keydata'):
-            flag.data = request.form.get('keydata')
-        db.session.add(flag)
+        if(solve_count == 1):
+            print("first blood")
+            CTFdStreamChallenge.send_first_blood(challenge, user)
 
-        db.session.commit()
+        elif(solve_count <= 3):
+            print("first three")
+            CTFdStreamChallenge.send_first_three(challenge, user)
 
-        for f in files:
-            utils.upload_file(file=f, chalid=chal.id)
-
-        db.session.commit()
-
-    @staticmethod
-    def read(challenge):
-        """
-        This method is in used to access the data of a challenge in a format processable by the front end.
-
-        :param challenge:
-        :return: Challenge object, data dictionary to be returned to the user
-        """
-        challenge = DynamicChallenge.query.filter_by(id=challenge.id).first()
-        data = {
-            'id': challenge.id,
-            'name': challenge.name,
-            'value': challenge.value,
-            'initial': challenge.initial,
-            'decay': challenge.decay,
-            'minimum': challenge.minimum,
-            'description': challenge.description,
-            'category': challenge.category,
-            'hidden': challenge.hidden,
-            'max_attempts': challenge.max_attempts,
-            'type': challenge.type,
-            'type_data': {
-                'id': DynamicValueChallenge.id,
-                'name': DynamicValueChallenge.name,
-                'templates': DynamicValueChallenge.templates,
-                'scripts': DynamicValueChallenge.scripts,
-            }
-        }
-        return challenge, data
-
-    @staticmethod
-    def update(challenge, request):
-        """
-        This method is used to update the information associated with a challenge. This should be kept strictly to the
-        Challenges table and any child tables.
-
-        :param challenge:
-        :param request:
-        :return:
-        """
-        challenge = DynamicChallenge.query.filter_by(id=challenge.id).first()
-
-        challenge.name = request.form['name']
-        challenge.description = request.form['description']
-        challenge.value = int(request.form.get('value', 0)) if request.form.get('value', 0) else 0
-        challenge.max_attempts = int(request.form.get('max_attempts', 0)) if request.form.get('max_attempts', 0) else 0
-        challenge.category = request.form['category']
-        challenge.hidden = 'hidden' in request.form
-
-        challenge.initial = request.form['initial']
-        challenge.minimum = request.form['minimum']
-        challenge.decay = request.form['decay']
-
-        db.session.commit()
-        db.session.close()
-
-    @staticmethod
-    def delete(challenge):
-        """
-        This method is used to delete the resources used by a challenge.
-
-        :param challenge:
-        :return:
-        """
-        WrongKeys.query.filter_by(chalid=challenge.id).delete()
-        Solves.query.filter_by(chalid=challenge.id).delete()
-        Keys.query.filter_by(chal=challenge.id).delete()
-        files = Files.query.filter_by(chal=challenge.id).all()
-        for f in files:
-            utils.delete_file(f.id)
-        Files.query.filter_by(chal=challenge.id).delete()
-        Tags.query.filter_by(chal=challenge.id).delete()
-        Hints.query.filter_by(chal=challenge.id).delete()
-        DynamicChallenge.query.filter_by(id=challenge.id).delete()
-        Challenges.query.filter_by(id=challenge.id).delete()
-        db.session.commit()
-
-    @staticmethod
-    def attempt(chal, request):
-        """
-        This method is used to check whether a given input is right or wrong. It does not make any changes and should
-        return a boolean for correctness and a string to be shown to the user. It is also in charge of parsing the
-        user's input from the request itself.
-
-        :param chal: The Challenge object from the database
-        :param request: The request the user submitted
-        :return: (boolean, string)
-        """
-        provided_key = request.form['key'].strip()
-        chal_keys = Keys.query.filter_by(chal=chal.id).all()
-        for chal_key in chal_keys:
-            if get_key_class(chal_key.type).compare(chal_key, provided_key):
-                return True, 'Correct'
-        return False, 'Incorrect'
-
-    @staticmethod
-    def solve(team, chal, request):
-        """
-        This method is used to insert Solves into the database in order to mark a challenge as solved.
-
-        :param team: The Team object from the database
-        :param chal: The Challenge object from the database
-        :param request: The request the user submitted
-        :return:
-        """
-        chal = DynamicChallenge.query.filter_by(id=chal.id).first()
-
-        solve_count = Solves.query.join(Teams, Solves.teamid == Teams.id).filter(Solves.chalid==chal.id, Teams.banned==False).count()
-
-        # It is important that this calculation takes into account floats.
-        # Hence this file uses from __future__ import division
-        value = (
-                    (
-                        (chal.minimum - chal.initial)/(chal.decay**2)
-                    ) * (solve_count**2)
-                ) + chal.initial
-
-        value = math.ceil(value)
-
-        if value < chal.minimum:
-            value = chal.minimum
-
-        chal.value = value
-
-        provided_key = request.form['key'].strip()
-        solve = Solves(teamid=team.id, chalid=chal.id, ip=utils.get_ip(req=request), flag=provided_key)
-        db.session.add(solve)
-
-        db.session.commit()
-        db.session.close()
-
-    @staticmethod
-    def fail(team, chal, request):
-        """
-        This method is used to insert WrongKeys into the database in order to mark an answer incorrect.
-
-        :param team: The Team object from the database
-        :param chal: The Challenge object from the database
-        :param request: The request the user submitted
-        :return:
-        """
-        provided_key = request.form['key'].strip()
-        wrong = WrongKeys(teamid=team.id, chalid=chal.id, ip=utils.get_ip(request), flag=provided_key)
-        db.session.add(wrong)
-        db.session.commit()
-        db.session.close()
-
-
-class DynamicChallenge(Challenges):
-    __mapper_args__ = {'polymorphic_identity': 'dynamic'}
-    id = db.Column(None, db.ForeignKey('challenges.id'), primary_key=True)
-    initial = db.Column(db.Integer)
-    minimum = db.Column(db.Integer)
-    decay = db.Column(db.Integer)
-
-    def __init__(self, name, description, value, category, type='dynamic', minimum=1, decay=50):
-        self.name = name
-        self.description = description
-        self.value = value
-        self.initial = value
-        self.category = category
-        self.type = type
-        self.minimum = minimum
-        self.decay = decay
-
+    @classmethod
+    def solve(cls, user, team, challenge, request):
+        super().solve(user, team, challenge, request)
+        try:
+            CTFdStreamChallenge.callback(challenge, user)
+        except Exception as e:
+            print(e)
 
 def load(app):
-    app.db.create_all()
-    CHALLENGE_CLASSES['dynamic'] = DynamicValueChallenge
-    register_plugin_assets_directory(app, base_path='/plugins/DynamicValueChallenge/assets/')
+    @app.route('/stream_labs_authorize', methods=['GET'])
+    @admins_only
+    def stream_labs_authorize():
+        url = STREAMLABS_API_BASE+"/authorize?"
+        params = {'client_id': CLIENT_ID,
+                  'redirect_uri': REDIRECT_URI,
+                  'response_type': 'code',
+                  'scope': 'donations.read donations.create alerts.create'}
+        full_url = url + urllib.parse.urlencode(params)
+        return "<a href=" + full_url + ">Authorize with Streamlabs!</a>"
+
+    @app.route('/stream_labs_oauth', methods=['GET'])
+    @admins_only
+    def stream_labs_oauth():
+        code = request.args.get('code')
+        print(code)
+        r = requests.post(STREAMLABS_API_BASE+"/token", data = {
+            'grant_type': 'authorization_code',
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'redirect_uri': REDIRECT_URI,
+            'code': code})
+        print(r.text)
+        global ACCESS_TOKEN
+        global REFRESH_TOKEN
+        ACCESS_TOKEN=r.json()['access_token']
+        REFRESH_TOKEN=r.json()['refresh_token']
+        return redirect("/")
+
+    upgrade()
+    CHALLENGE_CLASSES['stream'] = CTFdStreamChallenge
+    register_plugin_assets_directory(
+        app, base_path="/plugins/StreamLabsCTFdChallenge/assets/"
+    )
